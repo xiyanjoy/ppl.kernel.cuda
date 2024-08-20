@@ -107,3 +107,14 @@ else()
         ${PPLNN_DEP_PPLCOMMON_GIT}
         ${PPLNN_DEP_PPLCOMMON_VERSION})
 endif()
+
+set(CUTLASS_GIT_SRC "git@gitlab.sz.sensetime.com:HPC/cutlass.git")
+set(CUTLASS_GIT_VERSION "9d8d9b5160ffe509ec6611d7f968a2643a7f65ba")
+if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "7.0.0"
+    AND CUDA_VERSION VERSION_GREATER_EQUAL "11.4")
+    set(CUTLASS_GIT_SRC "https://github.com/NVIDIA/cutlass.git")
+    set(CUTLASS_GIT_VERSION "39c6a83f231d6db2bc6b9c251e7add77d68cbfb4") #for flash attn2
+endif()
+hpcc_declare_git_dep(cutlass
+    ${CUTLASS_GIT_SRC}
+    ${CUTLASS_GIT_VERSION})

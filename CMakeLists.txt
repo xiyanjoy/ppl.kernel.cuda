@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(PPLCUDAKernel)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
 
 find_package(Python3 REQUIRED)
 if(NOT Python3_FOUND)
@@ -225,12 +228,60 @@ endif()
 
 add_library(pplkernelcuda_static STATIC ${PPLNN_CUDA_SOURCES} ${PPLNN_CUDA_EXTERNAL_SOURCES})
 
+# disable installing of cutlass
+FetchContent_GetProperties(cutlass)
+if(NOT cutlass_POPULATED)
+    FetchContent_Populate(cutlass)
+    add_subdirectory(${cutlass_SOURCE_DIR} ${cutlass_BINARY_DIR} EXCLUDE_FROM_ALL)
+endif()
+get_filename_component(__CUTLASS_SOURCE_DIR__ "${HPCC_DEPS_DIR}/cutlass" ABSOLUTE)
+# for more information: https://cmake.org/cmake/help/latest/module/ExternalProject.html
+include(ExternalProject)
+ExternalProject_Add(
+    cutlass_lib
+    PREFIX cutlass_lib   # Root directory for the external project
+    SOURCE_DIR ${__CUTLASS_SOURCE_DIR__}
+    # BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/cutlass_ex-build
+    # URL ${CUTLASS_URL}
+    # URL_MD5 ${CUTLASS_MD5}
+    # UPDATE_COMMAND ""
+    # BUILD_BYPRODUCTS ${CUTLASS_LIBRARIES}
+    # CMAKE_ARGS -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
+    #            -DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}
+    #            -DCMAKE_CXX_FLAGS_DEBUG:STRING=${CMAKE_CXX_FLAGS_DEBUG}
+    #            -DCMAKE_CXX_FLAGS_RELEASE:STRING=${CMAKE_CXX_FLAGS_RELEASE}
+    CMAKE_CACHE_ARGS
+    #   -DCMAKE_CUDA_COMPILER:STRING=${CUDAToolkit_NVCC_EXECUTABLE}
+    #   -DCMAKE_C_COMPILER_LAUNCHER:STRING=${CMAKE_C_COMPILER_LAUNCHER}
+    #   -DCMAKE_CXX_COMPILER_LAUNCHER:STRING=${CMAKE_CXX_COMPILER_LAUNCHER}
+    #   -DCMAKE_INSTALL_PREFIX:PATH=${CUTLASS_INSTALL_DIR}
+    #   -DCMAKE_INSTALL_LIBDIR:PATH=${CUTLASS_LIBRARY_DIR}
+    #   -DCMAKE_INSTALL_MESSAGE:STRING=${CMAKE_INSTALL_MESSAGE}
+    #   -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
+      -DCUTLASS_LIBRARY_OPERATIONS:STRING=conv2d
+      -DCUTLASS_LIBRARY_KERNELS:STRING=simt_hfprop_*,tensorop_f16_*fprop,tensorop_h*fprop
+      -DCUTLASS_ENABLE_EXAMPLES:BOOL=OFF
+      -DCUTLASS_ENABLE_PROFILER:BOOL=OFF
+      -DCUTLASS_ENABLE_LIBRARY:BOOL=ON
+      -DCUTLASS_NVCC_ARCHS:STRING=80
+      -DCUTLASS_ENABLE_TESTS:BOOL=OFF
+      -DCUTLASS_UNITY_BUILD_ENABLED:BOOL=ON
+      -DCUTLASS_LIBRARY_DEBUG_POSTFIX:STRING=
+      -DCUTLASS_NVCC_EMBED_PTX:BOOL=OFF)
+add_dependencies(pplkernelcuda_static cutlass_lib)
+set(__PPLNN_CUTLASS_INCLUDE_DIRECTORIES__
+    ${__CUTLASS_SOURCE_DIR__}/include
+    ${__CUTLASS_SOURCE_DIR__}/tools/util/include
+    ${__CUTLASS_SOURCE_DIR__}/tools/library/include
+    ${__CUTLASS_SOURCE_DIR__}/tools/library/src)
+
 target_include_directories(pplkernelcuda_static PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
     ${CMAKE_CURRENT_BINARY_DIR}/conv
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/conv
     ${PPLCOMMON_INCLUDES}
+    ${__PPLNN_CUTLASS_INCLUDE_DIRECTORIES__}
     ${PPLNN_CUDA_EXTERNAL_INCLUDE_DIRECTORIES})
 target_link_directories(pplkernelcuda_static PUBLIC ${CMAKE_CUDA_HOST_IMPLICIT_LINK_DIRECTORIES} ${PPLNN_CUDA_EXTERNAL_LINK_DIRECTORIES})
 
