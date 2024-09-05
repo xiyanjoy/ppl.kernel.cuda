@@ -234,16 +234,20 @@ if(NOT cutlass_POPULATED)
     FetchContent_Populate(cutlass)
     add_subdirectory(${cutlass_SOURCE_DIR} ${cutlass_BINARY_DIR} EXCLUDE_FROM_ALL)
 endif()
-get_filename_component(__CUTLASS_SOURCE_DIR__ "${HPCC_DEPS_DIR}/cutlass" ABSOLUTE)
 # for more information: https://cmake.org/cmake/help/latest/module/ExternalProject.html
 include(ExternalProject)
+set(cutlass_lib_PREFIX "cutlass_oneflow")
+set(CUTLASS_URL
+https://github.com/Oneflow-Inc/cutlass/archive/e6f548d80bfdf1167d66adbbbcfc2ee3394f4777.zip)
+set(CUTLASS_MD5 425f8cf064ff47c81124e55490135f5c)
+get_filename_component(__CUTLASS_ONEFLOW_SOURCE_DIR__ "${CMAKE_CURRENT_BINARY_DIR}/${cutlass_lib_PREFIX}/src/cutlass_oneflow" ABSOLUTE)
 ExternalProject_Add(
-    cutlass_lib
-    PREFIX cutlass_lib   # Root directory for the external project
-    SOURCE_DIR ${__CUTLASS_SOURCE_DIR__}
+    cutlass_oneflow
+    PREFIX ${cutlass_lib_PREFIX}   # Root directory for the external project
+    URL ${CUTLASS_URL}
+    URL_MD5 ${CUTLASS_MD5}
+    # SOURCE_DIR ${__CUTLASS_ONEFLOW_SOURCE_DIR__}
     # BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/cutlass_ex-build
-    # URL ${CUTLASS_URL}
-    # URL_MD5 ${CUTLASS_MD5}
     # UPDATE_COMMAND ""
     # BUILD_BYPRODUCTS ${CUTLASS_LIBRARIES}
     # CMAKE_ARGS -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
@@ -263,17 +267,17 @@ ExternalProject_Add(
       -DCUTLASS_ENABLE_EXAMPLES:BOOL=OFF
       -DCUTLASS_ENABLE_PROFILER:BOOL=OFF
       -DCUTLASS_ENABLE_LIBRARY:BOOL=ON
-      -DCUTLASS_NVCC_ARCHS:STRING=80
+      -DCUTLASS_NVCC_ARCHS:STRING=89
       -DCUTLASS_ENABLE_TESTS:BOOL=OFF
       -DCUTLASS_UNITY_BUILD_ENABLED:BOOL=ON
       -DCUTLASS_LIBRARY_DEBUG_POSTFIX:STRING=
       -DCUTLASS_NVCC_EMBED_PTX:BOOL=OFF)
-add_dependencies(pplkernelcuda_static cutlass_lib)
-set(__PPLNN_CUTLASS_INCLUDE_DIRECTORIES__
-    ${__CUTLASS_SOURCE_DIR__}/include
-    ${__CUTLASS_SOURCE_DIR__}/tools/util/include
-    ${__CUTLASS_SOURCE_DIR__}/tools/library/include
-    ${__CUTLASS_SOURCE_DIR__}/tools/library/src)
+add_dependencies(pplkernelcuda_static cutlass_oneflow)
+set(__PPLNN_CUTLASS_ONEFLOW_INCLUDE_DIRECTORIES__
+    ${__CUTLASS_ONEFLOW_SOURCE_DIR__}/include
+    ${__CUTLASS_ONEFLOW_SOURCE_DIR__}/tools/util/include
+    ${__CUTLASS_ONEFLOW_SOURCE_DIR__}/tools/library/include
+    ${__CUTLASS_ONEFLOW_SOURCE_DIR__}/tools/library/src)
 
 target_include_directories(pplkernelcuda_static PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/include
@@ -281,9 +285,12 @@ target_include_directories(pplkernelcuda_static PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/conv
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/conv
     ${PPLCOMMON_INCLUDES}
-    ${__PPLNN_CUTLASS_INCLUDE_DIRECTORIES__}
+    ${__PPLNN_CUTLASS_ONEFLOW_INCLUDE_DIRECTORIES__}
     ${PPLNN_CUDA_EXTERNAL_INCLUDE_DIRECTORIES})
 target_link_directories(pplkernelcuda_static PUBLIC ${CMAKE_CUDA_HOST_IMPLICIT_LINK_DIRECTORIES} ${PPLNN_CUDA_EXTERNAL_LINK_DIRECTORIES})
+file(GLOB_RECURSE __CUTLASS_ONEFLOW_LIBRARYS__
+    ${CMAKE_CURRENT_BINARY_DIR}/${cutlass_lib_PREFIX}/src/cutlass_oneflow-build/tools/library/*.a)
+target_link_libraries(pplkernelcuda_static PUBLIC ${__CUTLASS_ONEFLOW_LIBRARYS__})
 
 # `PPLNN_CUDA_TOOLKIT_LINK_LIBRARIES` is also needed for generating pplkernecuda-config.cmake
 set(PPLNN_CUDA_TOOLKIT_LINK_LIBRARIES cuda cudart_static)
