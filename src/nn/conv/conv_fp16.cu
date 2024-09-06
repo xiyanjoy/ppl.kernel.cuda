@@ -40,6 +40,11 @@
 
 #include "float.h"
 
+#include "cutlass/library/operation_table.h"
+#include "cutlass/conv/conv2d_problem_size.h"
+#include "cutlass/library/library.h"
+#include "cutlass/library/singleton.h"
+
 #define TIMES 4
 
 #define SPK_KPARAM_LIST                                    \
@@ -344,6 +349,245 @@ uint64_t PPLCUDAConvolutionGetRuntimeBufSize(
     return total_size <= workspace ? total_size : workspace;
 }
 
+
+/* -----------------  cutlass kernel select api ------------------ */
+#define CUDA_CHECK(condition)                                                               \
+  for (cudaError_t _of_cuda_check_status = (condition); _of_cuda_check_status != cudaSuccess;) { \
+    std::cout << "[ERROR] Check failed: " #condition " : " << cudaGetErrorString(_of_cuda_check_status) \
+                << " (" << _of_cuda_check_status << ") "; \
+    exit(1); \
+  } \
+
+inline size_t HashCombine(size_t lhs, size_t rhs) {
+    return lhs ^ (rhs + 0x9e3779b9 + (lhs << 6U) + (lhs >> 2U));
+}
+
+bool IsWeakerAlginOperation(const cutlass::library::Operation* lhs,
+                            const cutlass::library::Operation* rhs) {
+    const char* lhs_name = lhs->description().name;
+    const char* rhs_name = rhs->description().name;
+    const size_t len = std::strlen(lhs_name);
+    const size_t suffix_len = std::strlen("align8");
+    if (std::strlen(rhs_name) != len) { return false; }
+    if (len < suffix_len) { return false; }
+    const size_t prefix_len = len - suffix_len;
+    if (std::strncmp(lhs_name, rhs_name, prefix_len) != 0) { return false; }
+    const auto& HasLegalSuffix = [&](const char* str) {
+        if (std::strncmp(str + prefix_len, "align", std::strlen("align")) != 0) { return false; }
+        const char align = str[len - 1];
+        return align == '8' || align == '4' || align == '2' || align == '1';
+    };
+    if ((!HasLegalSuffix(lhs_name)) || (!HasLegalSuffix(rhs_name))) { return false; }
+    return lhs_name[len - 1] < rhs_name[len - 1];
+}
+
+struct Conv2dOperationCacheKey {
+    cutlass::library::ConvFunctionalKey functional_key;
+    cutlass::library::Conv2dConfiguration configuraion;
+    size_t alignment;
+    Conv2dOperationCacheKey(cutlass::library::ConvFunctionalKey functional_key,
+                            cutlass::library::Conv2dConfiguration configuraion,
+                            cutlass::library::ConvArguments arguments)
+        : functional_key(functional_key), configuraion(configuraion) {
+        const auto IsStrideAligned = [&](const std::vector<int64_t>& stride, size_t n) {
+        return std::all_of(stride.cbegin(), stride.cend(),
+                            [&](const int64_t& s) { return s % n == 0; });
+        };
+        // CHECK_EQ(reinterpret_cast<uintptr_t>(arguments.A) % kCudaAlignSize, 0);
+        // CHECK_EQ(reinterpret_cast<uintptr_t>(arguments.B) % kCudaAlignSize, 0);
+        // CHECK_EQ(reinterpret_cast<uintptr_t>(arguments.C) % kCudaAlignSize, 0);
+        // CHECK_EQ(reinterpret_cast<uintptr_t>(arguments.D) % kCudaAlignSize, 0);
+        const auto IsAligned = [&](size_t n) {
+        return IsStrideAligned(configuraion.stride_a, n) && IsStrideAligned(configuraion.stride_b, n)
+                && IsStrideAligned(configuraion.stride_c, n);
+        };
+        if (IsAligned(8)) alignment = 8;
+        else if (IsAligned(4)) alignment = 4;
+        else if (IsAligned(2)) alignment = 2;
+        else alignment = 1;
+    }
+};
+
+struct Conv2dProblemSizeHasher {
+    size_t operator()(const cutlass::conv::Conv2dProblemSize& problem_size) const {
+        size_t hash = 0;
+        hash = HashCombine(hash, std::hash<int>()(problem_size.N));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.H));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.W));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.C));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.P));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.Q));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.K));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.R));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.S));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.pad_h));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.pad_w));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.stride_h));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.stride_w));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.dilation_h));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.dilation_w));
+        hash = HashCombine(hash, std::hash<int>()(static_cast<int>(problem_size.mode)));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.split_k_slices));
+        hash = HashCombine(hash, std::hash<int>()(problem_size.groups));
+        return hash;
+    }
+};
+
+struct Conv2dConfigurationHasher {
+    size_t operator()(const cutlass::library::Conv2dConfiguration& configuraion) const {
+        size_t hash = std::hash<int>()(static_cast<int>(configuraion.split_k_mode));
+        hash = HashCombine(hash, Conv2dProblemSizeHasher()(configuraion.problem_size));
+        for (const int64_t v : configuraion.stride_a) {
+            hash = HashCombine(hash, std::hash<int64_t>()(v));
+        }
+        for (const int64_t v : configuraion.stride_b) {
+            hash = HashCombine(hash, std::hash<int64_t>()(v));
+        }
+        for (const int64_t v : configuraion.stride_c) {
+            hash = HashCombine(hash, std::hash<int64_t>()(v));
+        }
+        return hash;
+    }
+};
+
+struct Conv2dOperationCacheKeyHasher {
+    size_t operator()(const Conv2dOperationCacheKey& key) const {
+        size_t hash = cutlass::library::ConvFunctionalKeyHasher()(key.functional_key);
+        hash = HashCombine(hash, Conv2dConfigurationHasher()(key.configuraion));
+        hash = HashCombine(hash, std::hash<size_t>()(key.alignment));
+        return hash;
+    }
+};
+
+inline bool operator==(const cutlass::library::Conv2dConfiguration& lhs,
+                       const cutlass::library::Conv2dConfiguration& rhs) {
+    return lhs.split_k_mode == rhs.split_k_mode && lhs.problem_size == rhs.problem_size
+            && lhs.stride_a == rhs.stride_a && lhs.stride_b == rhs.stride_b
+            && lhs.stride_c == rhs.stride_c;
+}
+
+inline bool operator==(const Conv2dOperationCacheKey& lhs, const Conv2dOperationCacheKey& rhs) {
+    return lhs.functional_key == rhs.functional_key && lhs.configuraion == rhs.configuraion
+            && lhs.alignment == rhs.alignment;
+}
+
+
+using CacheMap = std::unordered_map<Conv2dOperationCacheKey, const cutlass::library::Operation*,
+                                    Conv2dOperationCacheKeyHasher>;
+static std::unordered_map<int, CacheMap> cache;
+
+
+const cutlass::library::Operation* FindConv2dOperation(
+    cudaStream_t &stream, 
+    cutlass::library::ConvFunctionalKey functional_key,
+    const cutlass::library::Conv2dConfiguration& configuraion,
+    const cutlass::library::ConvArguments& arguments, 
+    int device_arch,
+    void* workspace, 
+    size_t workspace_size) 
+{
+    Conv2dOperationCacheKey cache_key(functional_key, configuraion, arguments);
+    const cutlass::library::Operation* fastest_operation = nullptr;
+    int dev = 0;
+    const auto& device_cache = cache[dev];
+    constexpr int turing_warmup_iters = 3;
+    // constexpr int turing_iters = TIMES;   // if too short, the cpu overhead maybe be too large
+    constexpr int turing_iters = 20;   // cutlass conv's cpu overhead is not stable, so the iters num can't be too small
+    const auto& it = device_cache.find(cache_key);
+    LOG(DEBUG) << "Start selecting";
+    if (it != device_cache.end()) {
+        LOG(DEBUG) << "find cache";
+        fastest_operation = it->second;
+        const size_t device_workspace_size = fastest_operation->get_device_workspace_size(&configuraion);
+        const size_t host_workspace_size = fastest_operation->get_host_workspace_size(&configuraion);
+
+        auto status = fastest_operation->can_implement(&configuraion, &arguments);
+        if(status != cutlass::Status::kSuccess || device_workspace_size > workspace_size) {
+            fastest_operation = nullptr;
+            return fastest_operation;
+        }
+        std::vector<uint8_t> host_workspace(host_workspace_size, 0);
+        if (fastest_operation->initialize(
+            &configuraion, 
+            host_workspace.data(), 
+            workspace, 
+            stream) != cutlass::Status::kSuccess) {
+            fastest_operation = nullptr;
+            return fastest_operation;
+        }
+
+    } else {
+        cudaEvent_t start;
+        cudaEvent_t end;
+        cudaEventCreate(&start);
+        cudaEventCreate(&end);
+        float minTime = FLT_MAX;
+        const auto& operations_map_it =
+            cutlass::library::Singleton::get().operation_table.conv2d_operations.find(functional_key);
+        if (operations_map_it == cutlass::library::Singleton::get().operation_table.conv2d_operations.cend()) {
+            fastest_operation = nullptr;
+            return fastest_operation;
+        }
+        const cutlass::library::ConvOperationVectorMap& operations_map = operations_map_it->second;
+        for (const auto& pair : operations_map) {
+            std::map<std::string, const cutlass::library::Operation*, std::greater<std::string>> operations;
+            for (auto operation : pair.second) operations.emplace(operation->description().name, operation);
+            const cutlass::library::Operation* prev_operation = nullptr;
+            for (const auto& name_operation : operations) {
+                const cutlass::library::Operation* operation = name_operation.second;
+                if (prev_operation != nullptr && IsWeakerAlginOperation(operation, prev_operation))
+                    continue;
+                if (operation->description().tile_description.minimum_compute_capability > device_arch
+                    || operation->description().tile_description.maximum_compute_capability < device_arch) {
+                    continue;
+                }
+                auto status = operation->can_implement(&configuraion, &arguments);  // lots of operation can't pass here;
+                if (status != cutlass::Status::kSuccess) continue;
+                const size_t host_workspace_size = operation->get_host_workspace_size(&configuraion);
+                const size_t device_workspace_size = operation->get_device_workspace_size(&configuraion);
+                if (device_workspace_size > workspace_size) continue;
+                std::vector<uint8_t> host_workspace(host_workspace_size, 0);
+                if (operation->initialize(
+                    &configuraion, 
+                    host_workspace.data(), 
+                    workspace,
+                    stream) != cutlass::Status::kSuccess) {
+                    continue;
+                }
+
+                const auto Run = [&]() {
+                    auto init_status = operation->initialize(&configuraion, host_workspace.data(),
+                                                            workspace, stream);
+                    if (init_status != cutlass::Status::kSuccess)
+                        LOG(ERROR) << "init_status != cutlass::Status::kSuccess";
+                    auto run_status = operation->run(&arguments, host_workspace.data(),
+                                                    workspace, stream);
+                    if (run_status != cutlass::Status::kSuccess)
+                        LOG(ERROR) << "run_status != cutlass::Status::kSuccess";
+                };
+                CUDA_CHECK(cudaDeviceSynchronize());
+                for (int i = 0; i < turing_warmup_iters; ++i) Run();
+                CUDA_CHECK(cudaEventRecord(start, stream));
+                for (int i = 0; i < turing_iters; ++i) Run();
+                CUDA_CHECK(cudaEventRecord(end, stream));
+                CUDA_CHECK(cudaEventSynchronize(end));
+                float elapsed = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, end));
+                prev_operation = operation;
+                LOG(DEBUG) << "kernel is : " << operation->description().name << " -> " << elapsed/turing_iters;
+                if ((fastest_operation == nullptr || elapsed * TIMES / turing_iters < minTime) && operation != nullptr) {
+                    fastest_operation = operation;
+                    minTime = elapsed * TIMES / turing_iters; 
+                    cache[dev][cache_key] = fastest_operation;
+                }
+            }
+        }
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    return fastest_operation;
+}
+
 /* -----------------  FP16 KERNEL ------------------ */
 
 double PPLCUDAConvolutionSelectKernel(
@@ -361,6 +605,156 @@ double PPLCUDAConvolutionSelectKernel(
     uint64_t workspace)
 {
 #if __CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10 >= 9020
+    float minTime = FLT_MAX;
+
+    bool is_cutlass_kernel_available = fuse_param.has_activation == 0 && !fuse_param.has_clip && fuse_param.has_prelu == 0 &&\
+        !fuse_param.has_elt && fuse_param.has_elt_activation == 0 && !fuse_param.has_elt_clip && fuse_param.has_elt_prelu == 0 &&\
+        fuse_param.elt_leaky==0 && !fuse_param.has_concat && conv_param.num_grp == 1;
+    if (is_cutlass_kernel_available) {
+        int device_arch = device_prop.major * 10 + device_prop.minor;
+        // nhwc
+        const int n = conv_param.in_num;
+        const int h = conv_param.in_height;
+        const int w = conv_param.in_width;
+        const int c = conv_param.num_chl_pad;
+        // krsc
+        const int k = conv_param.num_flt_pad;
+        const int r = conv_param.flt_height;
+        const int s = conv_param.flt_width;
+        // npqk
+        const int p = conv_param.out_height;
+        const int q = conv_param.out_width;
+
+        int pad_h = conv_param.pad_height;
+        int pad_w = conv_param.pad_width;
+        int stride_h = conv_param.stride_height;
+        int stride_w = conv_param.stride_width;
+        int dilation_h = conv_param.hole_height;
+        int dilation_w = conv_param.hole_height;
+        LOG(DEBUG) << "n: " << n << "\th: " << h << "\tw: " << w << "\tc: " << c;
+        LOG(DEBUG) << "k: " << k << "\tr: " << r << "\ts: " << s;
+        LOG(DEBUG) << "p: " << p << "\tq: " << q;
+        LOG(DEBUG) << "pad_h: " << pad_h << "\tpad_w: " << pad_w;
+        LOG(DEBUG) << "stride_h: " << stride_h << "\tstride_w: " << stride_w;
+        LOG(DEBUG) << "dilation_h: " << dilation_h << "\tdilation_w: " << dilation_w;
+
+        cutlass::library::ConvFunctionalKey functional_key(
+            cutlass::library::Provider::kCUTLASS, cutlass::library::ConvKind::kFprop,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::LayoutTypeID::kTensorNHWC,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::LayoutTypeID::kTensorNHWC,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::LayoutTypeID::kTensorNHWC,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::NumericTypeID::kF16
+        );
+
+        void* x_ptr = d_input;
+        void* w_ptr = d_flt;
+        void* y_ptr = d_output;
+        void* bias_ptr = nullptr;
+        if (conv_param.has_bias == 1) bias_ptr = bias;
+        void* workspace_ptr = d_temp_buf;
+
+        cutlass::conv::Conv2dProblemSize problem_size(
+            n, h, w, c, k, r, s, p, q, 
+            pad_h, pad_w, stride_h, stride_w, 
+            dilation_h, dilation_w,
+            cutlass::conv::Mode::kCrossCorrelation 
+        );
+        cutlass::library::Conv2dConfiguration configuraion;
+        configuraion.split_k_mode = cutlass::conv::SplitKMode::kSerial;
+        configuraion.problem_size = problem_size;
+        configuraion.stride_a = {c, w * c, h * w * c};
+        configuraion.stride_b = {c, s * c, r * s * c};
+        configuraion.stride_c = {0, 0, 0};
+        cutlass::library::ConvArguments arguments;
+        arguments.A = x_ptr;
+        arguments.B = w_ptr;
+        arguments.reordered_B = nullptr;
+        arguments.C = bias_ptr;
+        arguments.D = y_ptr;
+
+        union SP {
+            float f{};
+            half h;
+        };
+
+        SP alpha;
+        SP beta;
+        alpha.h = static_cast<half>(1.0F);
+        if (conv_param.has_bias != 1) beta.h = static_cast<half>(0.0F);
+        else beta.h = static_cast<half>(1.0F);
+    
+        arguments.alpha = &alpha;
+        arguments.beta = &beta;
+        arguments.pointer_mode = cutlass::library::ScalarPointerMode::kHost;
+
+        Conv2dOperationCacheKey cache_key(functional_key, configuraion, arguments);
+        const cutlass::library::Operation* fastest_operation;
+        int dev = 0;
+        const auto& device_cache = cache[dev];
+        constexpr int turing_warmup_iters = 3;
+        // constexpr int turing_iters = TIMES;   // if too short, the cpu overhead would be too large
+        constexpr int turing_iters = 20;   // cutlass conv's cpu overhead is not stable, so the iters num can't be too small
+        cudaEvent_t start;
+        cudaEvent_t end;
+        const auto& it = device_cache.find(cache_key);
+
+        fastest_operation = FindConv2dOperation(
+            stream, 
+            functional_key, 
+            configuraion, 
+            arguments, 
+            device_arch,
+            workspace_ptr,
+            workspace
+        );
+
+        cudaEventCreate(&start);
+        cudaEventCreate(&end);
+        if (fastest_operation != nullptr) {
+            const size_t device_workspace_size = fastest_operation->get_device_workspace_size(&configuraion);
+            const size_t host_workspace_size = fastest_operation->get_host_workspace_size(&configuraion);
+
+            auto status = fastest_operation->can_implement(&configuraion, &arguments);
+            if (status != cutlass::Status::kSuccess) LOG(ERROR) << "status != cutlass::Status::kSuccess";
+            if (device_workspace_size > workspace) LOG(ERROR) << "device_workspace_size > workspace";
+            std::vector<uint8_t> host_workspace(host_workspace_size, 0);
+            if (fastest_operation->initialize(
+                &configuraion, 
+                host_workspace.data(), 
+                workspace_ptr,
+                stream) != cutlass::Status::kSuccess) ;
+            const auto Run = [&]() {
+                auto init_status = fastest_operation->initialize(&configuraion, host_workspace.data(),
+                                                        workspace_ptr, stream);
+                if (init_status != cutlass::Status::kSuccess) LOG(ERROR) << "init_status != cutlass::Status::kSuccess";
+                auto run_status = fastest_operation->run(&arguments, host_workspace.data(),
+                                                workspace_ptr, stream);
+                if (run_status != cutlass::Status::kSuccess) LOG(ERROR) << "run_status != cutlass::Status::kSuccess";
+            };
+            CUDA_CHECK(cudaDeviceSynchronize());
+            for (int i = 0; i < turing_warmup_iters; ++i) Run();
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            for (int i = 0; i < turing_iters; ++i) Run();
+            CUDA_CHECK(cudaEventRecord(end, stream));
+            CUDA_CHECK(cudaEventSynchronize(end));
+            float elapsed = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, end));
+            minTime = elapsed * TIMES / turing_iters;
+            algo_param.algo_type = "CutlassHConv";
+            algo_param.algo_name = fastest_operation->description().name;
+            algo_param.kid = -1;
+            algo_param.splitk = device_workspace_size;  // use splitk to store workspace
+            algo_param.splitf = 1;
+        }
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    if(!is_cutlass_kernel_available) fuse_param = fuse_param_t{}; // reset to default
+    LOG(DEBUG) << "algo_type:" << algo_param.algo_type << 
+                " algo_name:" << algo_param.algo_name << 
+                " splitk:" << algo_param.splitk <<
+                " splitf:" << algo_param.splitf;
+    LOG(DEBUG) << "minTime: " << minTime;
 
     if (!is_g_fp16_kvec_initialized) {
         InitializeFP16ConvKernelContainer(g_fp16_kvec, device_prop, type);
@@ -374,14 +768,15 @@ double PPLCUDAConvolutionSelectKernel(
 
     std::unordered_map<size_t, algo_param_t>::const_iterator conv_shape_hash_iterator = g_conv_shape_hash.find(conv_shape_hash);
 
-    if (conv_shape_hash_iterator != g_conv_shape_hash.end()) {
-        algo_param.kid    = conv_shape_hash_iterator->second.kid;
-        algo_param.splitk = conv_shape_hash_iterator->second.splitk;
-        algo_param.splitf = conv_shape_hash_iterator->second.splitf;
-        algo_param.algo_name   = conv_shape_hash_iterator->second.algo_name;
+    // if (conv_shape_hash_iterator != g_conv_shape_hash.end()) {
+    //     algo_param.algo_type = "TuringHMMAImpgemm";
+    //     algo_param.kid    = conv_shape_hash_iterator->second.kid;
+    //     algo_param.splitk = conv_shape_hash_iterator->second.splitk;
+    //     algo_param.splitf = conv_shape_hash_iterator->second.splitf;
+    //     algo_param.algo_name   = conv_shape_hash_iterator->second.algo_name;
 
-        return ppl::common::RC_SUCCESS;
-    }
+    //     return ppl::common::RC_SUCCESS;
+    // }
 
     int pad_size = GetPadSize(type);
 
@@ -429,7 +824,7 @@ double PPLCUDAConvolutionSelectKernel(
     __half leaky         = __float2half(fuse_param.leaky);
     __half elt_leaky     = __float2half(fuse_param.elt_leaky);
 
-    float minTime = FLT_MAX;
+    // float minTime = FLT_MAX;
 
     float elapsed;
     cudaEvent_t begin, end;
@@ -479,6 +874,77 @@ double PPLCUDAConvolutionSelectKernel(
             }
 
             grid_size.z = conv_param.num_grp * splitk * splitf;
+
+            // warm up
+            for (int i = 0; i < 3; i++) {
+                if (g_fp16_kvec[kid].ktype == CONV_IDXN_C2 || g_fp16_kvec[kid].ktype == CONV_IDXN_C4 ||
+                    g_fp16_kvec[kid].ktype == CONV_IDXN_C32) {
+                    int tile_k_per_step = g_fp16_kvec[kid].tile_k_per_step;
+
+                    int img_pad_size = pad_size;
+                    int flt_pad_size = g_fp16_kvec[kid].flt_pad_size;
+                    int out_nhw      = out_hw * conv_param.in_num;
+
+                    int in_chl_per_grp_pad  = Align(num_chl_per_grp, img_pad_size);
+                    int flt_chl_per_grp_pad = Align(num_chl_per_grp, flt_pad_size);
+                    int num_flt_per_grp_pad = Align(num_flt_per_grp, img_pad_size);
+
+                    int kloop_num    = DivUp(flt_hw * flt_chl_per_grp_pad, g_fp16_kvec[kid].tile_k_per_cta);
+                    int koff_num_pad = Align(kloop_num * (g_fp16_kvec[kid].tile_k_per_cta / flt_pad_size), WARP_SIZE);
+
+                    (g_fp16_kvec[kid].idx_kptr)<<<grid_size, block_size, 0, stream>>>(IDX_KPARAM_LIST);
+                } else if (g_fp16_kvec[kid].ktype == CONV_2SPK_F1 || g_fp16_kvec[kid].ktype == CONV_2SPK_F3 ||
+                           g_fp16_kvec[kid].ktype == CONV_2SPK_FN || g_fp16_kvec[kid].ktype == CONV_2SPK_FS ||
+                           g_fp16_kvec[kid].ktype == CONV_SWZL_F1 || g_fp16_kvec[kid].ktype == CONV_SWZL_F3 ||
+                           g_fp16_kvec[kid].ktype == CONV_SWZL_FN) {
+
+                    int kloop_num = (flt_hw / splitf) * DivUp(num_chl_per_grp_pad, g_fp16_kvec[kid].tile_k_per_cta);
+
+                    lut_t in_lut, flt_lut;
+                    int in_lut_size, flt_lut_size;
+
+                    InitializeInputLut(in_lut_size, in_lut.idx, conv_param.flt_height, conv_param.flt_width, conv_param.in_height, conv_param.in_width, conv_param.pad_height, conv_param.pad_width, conv_param.hole_height, conv_param.hole_width, num_chl_per_grp_pad, conv_param.num_grp, g_fp16_kvec[kid].tile_k_per_cta, pad_size);
+
+                    InitializeFilterLut(flt_lut_size, flt_lut.idx, conv_param.flt_height, conv_param.flt_width, num_chl_per_grp_pad, g_fp16_kvec[kid].tile_k_per_cta, pad_size);
+
+                    if (splitk == 1) {
+                        g_fp16_kvec[kid].AdaptLutKernelSMemSize();
+
+                        if(g_fp16_kvec[kid].ktype == CONV_SWZL_F1 || g_fp16_kvec[kid].ktype == CONV_SWZL_F3 || g_fp16_kvec[kid].ktype == CONV_SWZL_FN)
+                            (g_fp16_kvec[kid].lut_kptr)<<<grid_size, block_size, smem_size, stream>>>(SWZL_LUT_KPARAM_LIST);
+                        else {
+                            (g_fp16_kvec[kid].lut_kptr)<<<grid_size, block_size, smem_size, stream>>>(LUT_KPARAM_LIST);
+                        }
+                    } else {
+                        int num_chl_per_spk_head, num_chl_per_spk_tail;
+
+                        InitializeNumChlPerSpk(num_chl_per_spk_head, num_chl_per_spk_tail, conv_param.num_chl, conv_param.num_grp, pad_size, g_fp16_kvec[kid].tile_k_per_cta, splitk);
+
+                        g_fp16_kvec[kid].AdaptSpkKernelSMemSize();
+
+                        if(g_fp16_kvec[kid].ktype == CONV_SWZL_F1 || g_fp16_kvec[kid].ktype == CONV_SWZL_F3 || g_fp16_kvec[kid].ktype == CONV_SWZL_FN)
+                            (g_fp16_kvec[kid].spk_kptr)<<<grid_size, block_size, smem_size, stream>>>(SWZL_SPK_KPARAM_LIST);
+                        else
+                            (g_fp16_kvec[kid].spk_kptr)<<<grid_size, block_size, smem_size, stream>>>(SPK_KPARAM_LIST);
+                    }
+
+                    if (splitk > 1 || splitf > 1) {
+                        int spk_width_v8  = num_flt_per_grp_pad * conv_param.num_grp / pad_size;
+                        int spk_height_v1 = out_hw * conv_param.in_num;
+
+                        dim3 merge_grid_size, merge_block_size;
+                        merge_block_size.x = 64; // empirical value
+                        merge_block_size.y = 1;
+                        merge_block_size.z = 1;
+
+                        merge_grid_size.x = spk_height_v1;
+                        merge_grid_size.y = DivUp(spk_width_v8, merge_block_size.x);
+                        merge_grid_size.z = 1;
+
+                        MergeConvSplitResults<<<merge_grid_size, merge_block_size, 0, stream>>>(MERGE_KPARAM_LIST);
+                    }
+                }
+            }
 
             cudaEventRecord(begin, stream);
 
@@ -557,6 +1023,7 @@ double PPLCUDAConvolutionSelectKernel(
             cudaEventElapsedTime(&elapsed, begin, end);
 
             if (elapsed < minTime) {
+                algo_param.algo_type = "TuringHMMAImpgemm";
                 algo_param.algo_name = g_fp16_kvec[kid].kname;
                 algo_param.kid    = kid;
                 algo_param.splitk = splitk;
@@ -565,6 +1032,13 @@ double PPLCUDAConvolutionSelectKernel(
             }
         }
     }
+
+    LOG(DEBUG) << "algo_type:" << algo_param.algo_type << 
+                " algo_name:" << algo_param.algo_name << 
+                " kid:" << algo_param.kid <<
+                " splitk:" << algo_param.splitk <<
+                " splitf:" << algo_param.splitf;
+    LOG(DEBUG) << "minTime: " << minTime;
 
     if (is_out_grp_pad) {
         PPLCUDAConvolutionCvtOutput(stream, d_output, final_out, type, conv_param);
@@ -594,6 +1068,130 @@ void PPLCUDAConvolutionForwardImp(
     fuse_param_t &fuse_param)
 {
 #if __CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10 >= 9020
+    if (algo_param.algo_type == "CutlassHConv") {
+        int device_arch = device_prop.major * 10 + device_prop.minor;
+        // nhwc
+        const int n = conv_param.in_num;
+        const int h = conv_param.in_height;
+        const int w = conv_param.in_width;
+        const int c = conv_param.num_chl_pad;
+        // krsc
+        const int k = conv_param.num_flt_pad;
+        const int r = conv_param.flt_height;
+        const int s = conv_param.flt_width;
+        // npqk
+        const int p = conv_param.out_height;
+        const int q = conv_param.out_width;
+
+        int pad_h = conv_param.pad_height;
+        int pad_w = conv_param.pad_width;
+        int stride_h = conv_param.stride_height;
+        int stride_w = conv_param.stride_width;
+        int dilation_h = conv_param.hole_height;
+        int dilation_w = conv_param.hole_height;
+
+        cutlass::library::ConvFunctionalKey functional_key(
+            cutlass::library::Provider::kCUTLASS, cutlass::library::ConvKind::kFprop,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::LayoutTypeID::kTensorNHWC,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::LayoutTypeID::kTensorNHWC,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::LayoutTypeID::kTensorNHWC,
+            cutlass::library::NumericTypeID::kF16, cutlass::library::NumericTypeID::kF16
+        );
+
+        void* x_ptr = d_input;
+        void* w_ptr = d_flt;
+        void* y_ptr = d_output;
+        void* bias_ptr = nullptr;
+        if (conv_param.has_bias == 1) bias_ptr = bias;
+
+        cutlass::conv::Conv2dProblemSize problem_size(
+            n, h, w, c, k, r, s, p, q, 
+            pad_h, pad_w, stride_h, stride_w, 
+            dilation_h, dilation_w,
+            cutlass::conv::Mode::kCrossCorrelation 
+        );
+        cutlass::library::Conv2dConfiguration configuraion;
+        configuraion.split_k_mode = cutlass::conv::SplitKMode::kSerial;
+        configuraion.problem_size = problem_size;
+        configuraion.stride_a = {c, w * c, h * w * c};
+        configuraion.stride_b = {c, s * c, r * s * c};
+        configuraion.stride_c = {0, 0, 0};
+        cutlass::library::ConvArguments arguments;
+        arguments.A = x_ptr;
+        arguments.B = w_ptr;
+        arguments.reordered_B = nullptr;
+        arguments.C = bias_ptr;
+        arguments.D = y_ptr;
+
+        union SP {
+            float f{};
+            half h;
+        };
+
+        SP alpha;
+        SP beta;
+        alpha.h = static_cast<half>(1.0F);
+        if (conv_param.has_bias != 1) beta.h = static_cast<half>(0.0F);
+        else beta.h = static_cast<half>(1.0F);
+    
+        arguments.alpha = &alpha;
+        arguments.beta = &beta;
+        arguments.pointer_mode = cutlass::library::ScalarPointerMode::kHost;
+        
+        // const cutlass::library::Operation* fastest_operation = nullptr;
+        Conv2dOperationCacheKey cache_key(functional_key, configuraion, arguments);
+        const cutlass::library::Operation* fastest_operation;
+        int dev = 0;
+        const auto& device_cache = cache[dev];
+        const auto& it = device_cache.find(cache_key);
+        if (it != device_cache.end()) {
+            fastest_operation = it->second;
+            const size_t host_workspace_size = fastest_operation->get_host_workspace_size(&configuraion);
+            const size_t device_workspace_size = fastest_operation->get_device_workspace_size(&configuraion);
+            std::vector<uint8_t> host_workspace(host_workspace_size, 0);
+            auto init_status = fastest_operation->initialize(&configuraion, host_workspace.data(),
+                                                    d_temp_buf, stream);
+            if (init_status != cutlass::Status::kSuccess) LOG(ERROR) << "init_status != cutlass::Status::kSuccess";
+            auto run_status = fastest_operation->run(&arguments, host_workspace.data(), d_temp_buf,
+                                            stream);
+            if (run_status != cutlass::Status::kSuccess) LOG(ERROR) << "run_status != cutlass::Status::kSuccess";
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        } else {
+            const auto& operations_map_it =
+                cutlass::library::Singleton::get().operation_table.conv2d_operations.find(functional_key);
+            if (operations_map_it == cutlass::library::Singleton::get().operation_table.conv2d_operations.cend())
+                LOG(ERROR) << "Can't find the operations_map_it";
+            const cutlass::library::ConvOperationVectorMap& operations_map = operations_map_it->second;
+            for (const auto& pair : operations_map) {
+                for (auto operation : pair.second) {
+                    if (algo_param.algo_name != operation->description().name) continue;
+                    if (operation->description().tile_description.minimum_compute_capability > device_arch
+                        || operation->description().tile_description.maximum_compute_capability < device_arch) {
+                        continue;
+                    }
+                    auto status = operation->can_implement(&configuraion, &arguments);
+                    if (status != cutlass::Status::kSuccess) continue;
+                    const size_t host_workspace_size = operation->get_host_workspace_size(&configuraion);
+                    const size_t device_workspace_size = operation->get_device_workspace_size(&configuraion);
+                    if (device_workspace_size > algo_param.splitk) continue;
+                    std::vector<uint8_t> host_workspace(host_workspace_size, 0);
+                    if (operation->initialize(&configuraion, host_workspace.data(), d_temp_buf, stream)
+                            != cutlass::Status::kSuccess) {
+                        continue;   // Werid: there are several operation has the same name?
+                    }
+                    if (operation == nullptr) LOG(ERROR) << "operation == nullptr";
+                    auto run_status = operation->run(&arguments, host_workspace.data(), d_temp_buf,
+                                                    stream);
+                    if (run_status != cutlass::Status::kSuccess) LOG(ERROR) << "run_status != cutlass::Status::kSuccess";
+                    CUDA_CHECK(cudaGetLastError());
+                    cache[dev][cache_key] = operation;
+                    return;
+                }
+            }
+        }
+    }
+
     if (!is_g_fp16_kvec_initialized)
         InitializeFP16ConvKernelContainer(g_fp16_kvec, device_prop, type);
 
