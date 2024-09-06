@@ -63,6 +63,7 @@
 #define SM80_MAX_DYN_SMEM_SIZE_PER_CTA  (163 * _BYTE1024_)
 #define SM86_MAX_DYN_SMEM_SIZE_PER_CTA  (99  * _BYTE1024_)
 #define SM87_MAX_DYN_SMEM_SIZE_PER_CTA  (163 * _BYTE1024_)
+#define SM89_MAX_DYN_SMEM_SIZE_PER_CTA  (99  * _BYTE1024_)
 
 #define ADD_KERNEL(_ktype, _kname, _lut_kptr, _spk_kptr, _idx_kptr) \
     kernel_container.push_back(kernel_info_t(kernel_container.size(), _ktype, _kname, _lut_kptr, _spk_kptr, _idx_kptr));
@@ -377,6 +378,8 @@ struct kernel_info_t {
 
         if (device_prop.major == 8 && device_prop.minor == 7)
             return (smem_size <= SM87_MAX_DYN_SMEM_SIZE_PER_CTA);
+        if (device_prop.major == 8 && device_prop.minor == 9)
+            return (smem_size <= SM89_MAX_DYN_SMEM_SIZE_PER_CTA);
 
         return false;
     }

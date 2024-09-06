@@ -201,13 +201,17 @@ if(CUDA_VERSION VERSION_GREATER_EQUAL "10.2")
     set(__NVCC_FLAGS__ "${PPLNN_CUDA_KERNEL_COMMON_NVCC_FLAGS}")
     if(CUDA_VERSION VERSION_GREATER_EQUAL "12.0")
         set(__NVCC_FLAGS__ "${__NVCC_FLAGS__} -gencode arch=compute_90,code=sm_90 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_87,code=sm_87 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_75,code=sm_75 -fno-var-tracking-assignments")
+        list(APPEND CUTLASS_REAL_ARCHS 90 89 87 86 80 75)
     elseif(CUDA_VERSION VERSION_GREATER_EQUAL "11.0")
         if(CUDA_VERSION VERSION_GREATER_EQUAL "11.4")
             set(__NVCC_FLAGS__ "${__NVCC_FLAGS__} -gencode arch=compute_87,code=sm_87 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_75,code=sm_75 -fno-var-tracking-assignments")
+            list(APPEND CUTLASS_REAL_ARCHS 87 86 80 75)
         elseif(CUDA_VERSION VERSION_GREATER_EQUAL "11.1")
             set(__NVCC_FLAGS__ "${__NVCC_FLAGS__} -gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_75,code=sm_75 -fno-var-tracking-assignments")
+            list(APPEND CUTLASS_REAL_ARCHS 86 80 75)
         else()
             set(__NVCC_FLAGS__ "${__NVCC_FLAGS__} -gencode arch=compute_80,code=sm_80 -gencode arch=compute_75,code=sm_75 -fno-var-tracking-assignments")
+            list(APPEND CUTLASS_REAL_ARCHS 80 75)
         endif()
     else()
         set(__NVCC_FLAGS__ "${__NVCC_FLAGS__} -gencode arch=compute_75,code=sm_75 -fno-var-tracking-assignments")
@@ -250,10 +254,11 @@ ExternalProject_Add(
     # BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/cutlass_ex-build
     # UPDATE_COMMAND ""
     # BUILD_BYPRODUCTS ${CUTLASS_LIBRARIES}
-    # CMAKE_ARGS -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
-    #            -DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}
-    #            -DCMAKE_CXX_FLAGS_DEBUG:STRING=${CMAKE_CXX_FLAGS_DEBUG}
-    #            -DCMAKE_CXX_FLAGS_RELEASE:STRING=${CMAKE_CXX_FLAGS_RELEASE}
+    CMAKE_ARGS 
+        -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
+        -DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}
+        -DCMAKE_CXX_FLAGS_DEBUG:STRING=${CMAKE_CXX_FLAGS_DEBUG}
+        -DCMAKE_CXX_FLAGS_RELEASE:STRING=${CMAKE_CXX_FLAGS_RELEASE}
     CMAKE_CACHE_ARGS
     #   -DCMAKE_CUDA_COMPILER:STRING=${CUDAToolkit_NVCC_EXECUTABLE}
     #   -DCMAKE_C_COMPILER_LAUNCHER:STRING=${CMAKE_C_COMPILER_LAUNCHER}
@@ -267,7 +272,7 @@ ExternalProject_Add(
       -DCUTLASS_ENABLE_EXAMPLES:BOOL=OFF
       -DCUTLASS_ENABLE_PROFILER:BOOL=OFF
       -DCUTLASS_ENABLE_LIBRARY:BOOL=ON
-      -DCUTLASS_NVCC_ARCHS:STRING=89
+      -DCUTLASS_NVCC_ARCHS:STRING=${CUTLASS_REAL_ARCHS}
       -DCUTLASS_ENABLE_TESTS:BOOL=OFF
       -DCUTLASS_UNITY_BUILD_ENABLED:BOOL=ON
       -DCUTLASS_LIBRARY_DEBUG_POSTFIX:STRING=
