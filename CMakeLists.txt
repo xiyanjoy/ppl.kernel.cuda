@@ -245,6 +245,7 @@ set(CUTLASS_URL
 https://github.com/Oneflow-Inc/cutlass/archive/e6f548d80bfdf1167d66adbbbcfc2ee3394f4777.zip)
 set(CUTLASS_MD5 425f8cf064ff47c81124e55490135f5c)
 get_filename_component(__CUTLASS_ONEFLOW_SOURCE_DIR__ "${CMAKE_CURRENT_BINARY_DIR}/${cutlass_lib_PREFIX}/src/cutlass_oneflow" ABSOLUTE)
+set(CUTLASS_LIBRARIES ${CMAKE_CURRENT_BINARY_DIR}/${cutlass_lib_PREFIX}/src/cutlass_oneflow-build/tools/library/libcutlass.a)
 ExternalProject_Add(
     cutlass_oneflow
     PREFIX ${cutlass_lib_PREFIX}   # Root directory for the external project
@@ -253,7 +254,7 @@ ExternalProject_Add(
     # SOURCE_DIR ${__CUTLASS_ONEFLOW_SOURCE_DIR__}
     # BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/cutlass_ex-build
     # UPDATE_COMMAND ""
-    # BUILD_BYPRODUCTS ${CUTLASS_LIBRARIES}
+    BUILD_BYPRODUCTS ${CUTLASS_LIBRARIES}
     CMAKE_ARGS 
         -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
         -DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}
@@ -293,9 +294,9 @@ target_include_directories(pplkernelcuda_static PUBLIC
     ${__PPLNN_CUTLASS_ONEFLOW_INCLUDE_DIRECTORIES__}
     ${PPLNN_CUDA_EXTERNAL_INCLUDE_DIRECTORIES})
 target_link_directories(pplkernelcuda_static PUBLIC ${CMAKE_CUDA_HOST_IMPLICIT_LINK_DIRECTORIES} ${PPLNN_CUDA_EXTERNAL_LINK_DIRECTORIES})
-file(GLOB_RECURSE __CUTLASS_ONEFLOW_LIBRARYS__
-    ${CMAKE_CURRENT_BINARY_DIR}/${cutlass_lib_PREFIX}/src/cutlass_oneflow-build/tools/library/*.a)
-target_link_libraries(pplkernelcuda_static PUBLIC ${__CUTLASS_ONEFLOW_LIBRARYS__})
+# file(GLOB_RECURSE __CUTLASS_ONEFLOW_LIBRARYS__
+#     ${CMAKE_CURRENT_BINARY_DIR}/${cutlass_lib_PREFIX}/src/cutlass_oneflow-build/tools/library/*.a)
+target_link_libraries(pplkernelcuda_static PUBLIC ${CUTLASS_LIBRARIES})
 
 # `PPLNN_CUDA_TOOLKIT_LINK_LIBRARIES` is also needed for generating pplkernecuda-config.cmake
 set(PPLNN_CUDA_TOOLKIT_LINK_LIBRARIES cuda cudart_static)
